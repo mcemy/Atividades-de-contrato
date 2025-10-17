@@ -1,0 +1,667 @@
+/***********************
+ *  WEBHOOK HANDLER - PROTEÇÃO BALANCEADA
+ ***********************/
+
+const SHEET_ID = '1exJjOYDoC7QjDAuFvrI2rl3i2cM1rNBsAwLpb6EBkiw';
+const SHEET_LOG = 'WebhookLog';
+const SHEET_ERR = 'WebhookErrors';
+
+const CREATED_ACTIVITIES_CACHE = {};
+const PROCESSING_LOCK = PropertiesService.getScriptProperties();
+const CACHE_LOCK = CacheService.getScriptCache();
+
+// ✅ Configurações balanceadas
+const DEBOUNCE_SECONDS = 15;  // 15 segundos entre processamentos do mesmo deal
+const GLOBAL_COOLDOWN_MINUTES = 2;  // 2 minutos de cooldown global
+const CACHE_LOCK_SECONDS = 30;  // 30 segundos de lock no cache
+
+/***********************
+ *  PROTEÇÃO DE ENTRADA - PRIMEIRA LINHA DE DEFESA
+ ***********************/
+function canProcessDeal_(dealId, statusChange) {
+  const cacheKey = `PROC_${dealId}_${statusChange}`;
+  
+  // ✅ Usa Cache (mais rápido e confiável que Properties)
+  const isProcessing = CACHE_LOCK.get(cacheKey);
+  
+  if (isProcessing) {
+    Logger.log('[Deal %s] 🚫 BLOQUEADO - Processamento em andamento para %s', dealId, statusChange);
+    return false;
+  }
+  
+  // ✅ Marca como "em processamento" por 30 segundos
+  CACHE_LOCK.put(cacheKey, 'true', CACHE_LOCK_SECONDS);
+  Logger.log('[Deal %s] ✅ Permitido processar %s', dealId, statusChange);
+  return true;
+}
+
+function releaseCacheLock_(dealId, statusChange) {
+  const cacheKey = `PROC_${dealId}_${statusChange}`;
+  CACHE_LOCK.remove(cacheKey);
+  Logger.log('[Deal %s] 🔓 Cache lock liberado para %s', dealId, statusChange);
+}
+
+/***********************
+ *  CONTROLE DE DUPLICAÇÃO E CONCORRÊNCIA
+ ***********************/
+function acquireProcessingLock_(dealId, statusChange) {
+  const lockKey = `LOCK_${dealId}_${statusChange}`;
+  const now = new Date().getTime();
+  
+  try {
+    const lastProcessed = PROCESSING_LOCK.getProperty(lockKey);
+    
+    if (lastProcessed) {
+      const diffSeconds = (now - parseInt(lastProcessed)) / 1000;
+      
+      if (diffSeconds < DEBOUNCE_SECONDS) {
+        Logger.log('[Deal %s] ⏸️ LOCK ATIVO - Ignorando (processado há %ss)', dealId, diffSeconds.toFixed(1));
+        return false;
+      }
+    }
+    
+    PROCESSING_LOCK.setProperty(lockKey, String(now));
+    Logger.log('[Deal %s] 🔒 Lock adquirido para %s', dealId, statusChange);
+    return true;
+    
+  } catch (err) {
+    Logger.log('[Deal %s] ⚠️ Erro ao verificar lock: %s', dealId, err.message);
+    return false;
+  }
+}
+
+function releaseProcessingLock_(dealId, statusChange) {
+  const lockKey = `LOCK_${dealId}_${statusChange}`;
+  try {
+    PROCESSING_LOCK.deleteProperty(lockKey);
+    Logger.log('[Deal %s] 🔓 Lock liberado para %s', dealId, statusChange);
+  } catch (err) {
+    Logger.log('[Deal %s] ⚠️ Erro ao liberar lock: %s', dealId, err.message);
+  }
+}
+
+// ✅ Verifica se o deal já foi processado recentemente (cooldown mais curto)
+function isDealRecentlyProcessed_(dealId) {
+  const globalKey = `GLOBAL_PROCESSED_${dealId}`;
+  const lastTime = PROCESSING_LOCK.getProperty(globalKey);
+  
+  if (lastTime) {
+    const diffMinutes = (new Date().getTime() - parseInt(lastTime)) / 60000;
+    if (diffMinutes < GLOBAL_COOLDOWN_MINUTES) {
+      Logger.log('[Deal %s] ⏸️ Processado recentemente (há %.1f min)', dealId, diffMinutes);
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+function markDealAsProcessed_(dealId) {
+  const globalKey = `GLOBAL_PROCESSED_${dealId}`;
+  PROCESSING_LOCK.setProperty(globalKey, String(new Date().getTime()));
+  Logger.log('[Deal %s] ✅ Marcado como processado globalmente', dealId);
+}
+
+/***********************
+ *  HANDLERS PRINCIPAIS
+ ***********************/
+function doPost(e) {
+  try {
+    const raw = (e && e.postData && e.postData.contents) ? e.postData.contents : '';
+    
+    if (!raw) throw new Error('Evento sem corpo postData');
+
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch (err) {
+      throw new Error('JSON inválido: ' + err.message);
+    }
+
+    const meta = payload.meta || {};
+    const current = payload.data || payload.current || {};
+    const previous = payload.previous || {};
+
+    const action = meta.action || '';
+    const entity = meta.object || meta.entity || '';
+    const dealId = current.id || '';
+    const title = current.title || '';
+
+    if (entity === 'deal' && dealId) {
+      
+      let fullDeal = current;
+      try {
+        const r = pd_('/deals/' + dealId);
+        if (r && r.data) fullDeal = r.data;
+      } catch (_) {}
+
+      if (!isDealEligible_(fullDeal)) {
+        const reason = getIneligibilityReason_(fullDeal);
+        
+        Logger.log('[Deal %s] ⚠️ Não elegível: %s', dealId, reason);
+        
+        return jsonOut_({ 
+          ok: true, 
+          skipped: 'not_eligible', 
+          dealId: dealId,
+          reason: reason
+        });
+      }
+
+      const statusChanges = detectStatusChangesToIniciar_(fullDeal, previous);
+      
+      if (statusChanges.length === 0) {
+        Logger.log('[Deal %s] ℹ️ Nenhuma mudança de status detectada', dealId);
+        
+        return jsonOut_({ ok:true, skipped:'no_valid_status_change', dealId });
+      }
+
+      // ✅ Cria chave única para esta mudança específica
+      const changeKey = statusChanges.map(c => c.plan).sort().join(',');
+      
+      Logger.log('[Deal %s] 🎯 Mudanças detectadas: %s', dealId, changeKey);
+      
+      // ✅ BARREIRA 1: Verificação via Cache (ultra-rápida)
+      if (!canProcessDeal_(dealId, changeKey)) {
+        return jsonOut_({ 
+          ok: true, 
+          skipped: 'cache_lock', 
+          dealId: dealId,
+          message: 'Deal em processamento (cache lock)'
+        });
+      }
+      
+      // ✅ BARREIRA 2: Cooldown global de 2 minutos
+      if (isDealRecentlyProcessed_(dealId)) {
+        releaseCacheLock_(dealId, changeKey);
+        return jsonOut_({ 
+          ok: true, 
+          skipped: 'recently_processed', 
+          dealId: dealId,
+          message: 'Deal processado recentemente'
+        });
+      }
+
+      // ✅ BARREIRA 3: Lock por mudança específica (15 segundos)
+      if (!acquireProcessingLock_(dealId, changeKey)) {
+        releaseCacheLock_(dealId, changeKey);
+        return jsonOut_({ 
+          ok: true, 
+          skipped: 'debounce_lock', 
+          dealId: dealId,
+          reason: 'Processamento já em andamento'
+        });
+      }
+
+      try {
+        const result = processDealWebhook_(fullDeal, statusChanges);
+
+        // 📊 Formata as atividades criadas
+        let atividadesTexto = 'Nenhuma';
+        let detalhesTexto = '';
+        
+        if (result.created && result.created > 0) {
+          atividadesTexto = result.createdActivities ? result.createdActivities.join('\n') : `${result.created} criada(s)`;
+          detalhesTexto = `${result.created} criada(s)`;
+          
+          // ✅ Marca o deal como processado globalmente
+          markDealAsProcessed_(dealId);
+          
+          Logger.log('[Deal %s] ✅ %d atividades criadas com sucesso', dealId, result.created);
+        } else {
+          detalhesTexto = result.skipped > 0 ? `${result.skipped} já existente(s)` : 'Nenhuma ação necessária';
+          Logger.log('[Deal %s] ℹ️ %s', dealId, detalhesTexto);
+        }
+
+        appendLogToSheet_({
+          timestamp: new Date(),
+          dealId: dealId,
+          title: title,
+          action: 'Processamento incremental',
+          atividadesCriadas: atividadesTexto,
+          detalhes: detalhesTexto
+        });
+
+        return jsonOut_({
+          ok: true,
+          processed: new Date().toISOString(),
+          dealId: dealId,
+          statusChanges: statusChanges,
+          result: result
+        });
+
+      } finally {
+        // ✅ Libera os locks
+        releaseProcessingLock_(dealId, changeKey);
+        releaseCacheLock_(dealId, changeKey);
+      }
+    }
+
+    return jsonOut_({
+      ok: true,
+      processed: new Date().toISOString(),
+      action: action,
+      entity: entity,
+      dealId: dealId
+    });
+
+  } catch (err) {
+    appendErrToSheet_('doPost', err, e);
+    return jsonOut_({
+      ok: false,
+      error: String(err && err.message || err),
+      timestamp: new Date().toISOString()
+    });
+  }
+}
+
+function doGet(e) {
+  return ContentService
+    .createTextOutput(JSON.stringify({
+      status: 'online',
+      service: 'Pipedrive Webhook Handler - Deal (BALANCED)',
+      mode: 'all_eligible_deals',
+      debounceSeconds: DEBOUNCE_SECONDS,
+      globalCooldownMinutes: GLOBAL_COOLDOWN_MINUTES,
+      cacheLockSeconds: CACHE_LOCK_SECONDS,
+      timestamp: new Date().toISOString(),
+      timezone: CFG.TZ,
+      statusIds: STATUS_IDS,
+      priorityIds: getPriorityIds_()
+    }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/***********************
+ *  VERIFICAÇÃO DE ELEGIBILIDADE
+ ***********************/
+function isDealEligible_(deal) {
+  if (deal.status !== 'open') return false;
+  if (!deal[FIELD_KEYS.dataInicioContrato]) return false;
+  if (!deal[FIELD_KEYS.dataTerminoTriagem]) return false;
+  if (deal[FIELD_KEYS.dataTerminoContrato]) return false;
+  
+  const hasStatus = !!(
+    deal[FIELD_KEYS.status.FINANCIAMENTO] ||
+    deal[FIELD_KEYS.status.ESCRITURA] ||
+    deal[FIELD_KEYS.status.CCV] ||
+    deal[FIELD_KEYS.status.FGTS_AVISTA]
+  );
+  
+  return hasStatus;
+}
+
+function getIneligibilityReason_(deal) {
+  if (deal.status !== 'open') return 'Status ≠ "Aberto"';
+  if (!deal[FIELD_KEYS.dataInicioContrato]) return 'Sem "Data Início Contrato"';
+  if (!deal[FIELD_KEYS.dataTerminoTriagem]) return 'Sem "Data Término Triagem"';
+  if (deal[FIELD_KEYS.dataTerminoContrato]) return 'Contrato já finalizado';
+  
+  const hasIniciar = !!(
+    isIniciar_(deal[FIELD_KEYS.status.FINANCIAMENTO], 'FINANCIAMENTO') ||
+    isIniciar_(deal[FIELD_KEYS.status.ESCRITURA], 'ESCRITURA') ||
+    isIniciar_(deal[FIELD_KEYS.status.CCV], 'CCV') ||
+    isIniciar_(deal[FIELD_KEYS.status.FGTS_AVISTA], 'FGTS_AVISTA')
+  );
+  
+  if (!hasIniciar) return 'Status ≠ "01. Iniciar"';
+  
+  return 'Sem status definido';
+}
+
+/***********************
+ *  CACHE DE ATIVIDADES
+ ***********************/
+function activityWasJustCreated_(dealId, subject) {
+  const key = `${dealId}_${normalizeSubject_(subject)}`;
+  return CREATED_ACTIVITIES_CACHE[key] === true;
+}
+
+function markActivityAsCreated_(dealId, subject) {
+  const key = `${dealId}_${normalizeSubject_(subject)}`;
+  CREATED_ACTIVITIES_CACHE[key] = true;
+}
+
+/***********************
+ *  DETECÇÃO DE MUDANÇAS
+ ***********************/
+function detectStatusChangesToIniciar_(currentDeal, previousPayload) {
+  const changes = [];
+  
+  const statusFields = {
+    'FINANCIAMENTO': FIELD_KEYS.status.FINANCIAMENTO,
+    'ESCRITURA': FIELD_KEYS.status.ESCRITURA,
+    'CCV': FIELD_KEYS.status.CCV,
+    'FGTS_AVISTA': FIELD_KEYS.status.FGTS_AVISTA
+  };
+
+  for (const [planKey, fieldKey] of Object.entries(statusFields)) {
+    const currentVal = currentDeal[fieldKey];
+    
+    let previousVal = null;
+    if (previousPayload.custom_fields && previousPayload.custom_fields[fieldKey] !== undefined) {
+      previousVal = previousPayload.custom_fields[fieldKey];
+    } else if (previousPayload[fieldKey] !== undefined) {
+      previousVal = previousPayload[fieldKey];
+    }
+    
+    const currentNorm = normalizeStatus_(currentVal);
+    const previousNorm = normalizeStatus_(previousVal);
+    const currentIsIniciar = isIniciar_(currentVal, planKey);
+    const previousIsIniciar = isIniciar_(previousVal, planKey);
+    
+    if (currentIsIniciar && !previousIsIniciar) {
+      const planName = planKey === 'FINANCIAMENTO' ? 'FIN' : planKey === 'FGTS_AVISTA' ? 'FGTS' : planKey;
+      changes.push({
+        plan: planName,
+        from: previousNorm || '(vazio)',
+        to: currentNorm || 'iniciar'
+      });
+      Logger.log('[Deal %s] ✔ %s: "%s" → "iniciar"', currentDeal.id, planKey, previousNorm || '(vazio)');
+    }
+  }
+  
+  const triagemFieldKey = FIELD_KEYS.dataTerminoTriagem;
+  const currentTriagem = currentDeal[triagemFieldKey];
+  
+  let previousTriagem = null;
+  if (previousPayload.custom_fields && previousPayload.custom_fields[triagemFieldKey] !== undefined) {
+    previousTriagem = previousPayload.custom_fields[triagemFieldKey];
+  } else if (previousPayload[triagemFieldKey] !== undefined) {
+    previousTriagem = previousPayload[triagemFieldKey];
+  }
+  
+  if (currentTriagem && !previousTriagem) {
+    Logger.log('[Deal %s] ✔ Data Término Triagem preenchida: %s', currentDeal.id, currentTriagem);
+    
+    for (const [planKey, fieldKey] of Object.entries(statusFields)) {
+      const currentVal = currentDeal[fieldKey];
+      if (isIniciar_(currentVal, planKey)) {
+        const planName = planKey === 'FINANCIAMENTO' ? 'FIN' : planKey === 'FGTS_AVISTA' ? 'FGTS' : planKey;
+        
+        const alreadyAdded = changes.some(c => c.plan === planName);
+        if (!alreadyAdded) {
+          changes.push({
+            plan: planName,
+            from: 'triagem_preenchida',
+            to: 'iniciar'
+          });
+          Logger.log('[Deal %s] ✔ %s já estava em "Iniciar" - criando atividades', currentDeal.id, planKey);
+        }
+      }
+    }
+  }
+
+  return changes;
+}
+
+/***********************
+ *  PROCESSAMENTO DO DEAL
+ ***********************/
+function processDealWebhook_(deal, statusChanges) {
+  const today = tzToday_();
+  
+  if (isWeekend_(today)) {
+    return { ok:true, skipped:'weekend', date: ymd_(today) };
+  }
+
+  const baseStr = deal[FIELD_KEYS.dataInicioContrato];
+  const triStr  = deal[FIELD_KEYS.dataTerminoTriagem];
+  
+  if (!baseStr || !triStr) {
+    return { ok:true, skipped:'missing_base_or_triagem' };
+  }
+
+  const baseDate = parseLocalDate_(baseStr);
+  const triDate  = parseLocalDate_(triStr);
+  
+  if (today < triDate) {
+    return { ok:true, skipped:'before_triagem', today: ymd_(today), triDate: ymd_(triDate) };
+  }
+
+  const dx = diffDays_(baseDate, today);
+  let created = 0;
+  let skipped = 0;
+  const createdActivities = [];
+
+  for (const change of statusChanges) {
+    const planKey = change.plan;
+    const pl = PLAN[planKey];
+    
+    if (!pl) {
+      Logger.log('[Deal %s] ⚠ Plano não encontrado: %s', deal.id, planKey);
+      continue;
+    }
+    
+    const dayConfigs = pl.days.slice();
+
+    Logger.log('[Deal %s] ▶ Criando atividades para %s', deal.id, planKey);
+
+    dayConfigs.forEach((config) => {
+      const d = config.day;
+      const hour = config.hour;
+      
+      if (dx >= d) {
+        const subject  = pl.title(d);
+        const note     = pl.note(d);
+        const priority = getPriority_(planKey, d);
+        const dueRaw   = addDays_(baseDate, d);
+        const dueBday  = nextBusinessDay_(dueRaw);
+        const dueY     = ymd_(dueBday);
+        const dueTime  = String(hour).padStart(2, '0') + ':00';
+
+        if (activityWasJustCreated_(deal.id, subject)) {
+          skipped++;
+          return;
+        }
+
+        if (activityExistsStrong_({ dealId: deal.id, subject, dueDateYmd: dueY, dueTime }) || 
+            activityExistsBySubjectType_({ dealId: deal.id, subject })) {
+          skipped++;
+          return;
+        }
+
+        createActivity_({ deal, subject, note, dueDate: dueBday, dueTime, priority });
+        markActivityAsCreated_(deal.id, subject);
+        created++;
+        createdActivities.push(`✓ DIA ${d}`);
+        Logger.log('[Deal %s]   ✔ Backlog: %s | D+%s %s', deal.id, subject, d, dueTime);
+      }
+    });
+
+    const nextConfig = dayConfigs.find(cfg => cfg.day > dx);
+    if (nextConfig) {
+      const nextD = nextConfig.day;
+      const nextHour = nextConfig.hour;
+      const subjectN  = pl.title(nextD);
+      const noteN     = pl.note(nextD);
+      const priorityN = getPriority_(planKey, nextD);
+      const dueRawN   = addDays_(baseDate, nextD);
+      const dueBdayN  = nextBusinessDay_(dueRawN);
+      const dueYN     = ymd_(dueBdayN);
+      const dueTimeN  = String(nextHour).padStart(2, '0') + ':00';
+
+      if (activityWasJustCreated_(deal.id, subjectN)) {
+        skipped++;
+      } else if (!activityExistsStrong_({ dealId: deal.id, subject: subjectN, dueDateYmd: dueYN, dueTime: dueTimeN }) && 
+          !activityExistsBySubjectType_({ dealId: deal.id, subject: subjectN })) {
+        createActivity_({ deal, subject: subjectN, note: noteN, dueDate: dueBdayN, dueTime: dueTimeN, priority: priorityN });
+        markActivityAsCreated_(deal.id, subjectN);
+        created++;
+        createdActivities.push(`✓ DIA ${nextD}`);
+        Logger.log('[Deal %s]   ✔ Próxima: %s | D+%s %s', deal.id, subjectN, nextD, dueTimeN);
+      } else {
+        skipped++;
+      }
+    }
+  }
+
+  return { 
+    ok: true, 
+    plans: statusChanges.map(c => c.plan),
+    created, 
+    skipped,
+    createdActivities,
+    dx: dx,
+    date: ymd_(today) 
+  };
+}
+
+/***********************
+ *  FUNÇÕES DE LOG
+ ***********************/
+function getLogSpreadsheet_() {
+  try {
+    return SpreadsheetApp.openById(SHEET_ID);
+  } catch (err) {
+    throw new Error('Erro ao abrir planilha ' + SHEET_ID + ': ' + err.message);
+  }
+}
+
+function getOrCreateSheet_(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    if (headers && headers.length) {
+      const headerRange = sh.getRange(1, 1, 1, headers.length);
+      headerRange.setValues([headers])
+                 .setFontWeight('bold')
+                 .setBackground('#4285f4')
+                 .setFontColor('#ffffff')
+                 .setHorizontalAlignment('center');
+      sh.setFrozenRows(1);
+      for (let i = 1; i <= headers.length; i++) sh.autoResizeColumn(i);
+    }
+  }
+  return sh;
+}
+
+function appendLogToSheet_({ timestamp, dealId, title, action, atividadesCriadas, detalhes }) {
+  try {
+    const ss = getLogSpreadsheet_();
+    const sh = getOrCreateSheet_(ss, SHEET_LOG, [
+      'Timestamp',
+      'DealID',
+      'Title',
+      'Action',
+      'Atividades Criadas',
+      'Detalhes'
+    ]);
+    
+    sh.appendRow([
+      Utilities.formatDate(timestamp || new Date(), CFG.TZ, 'dd/MM/yyyy, HH:mm:ss'),
+      String(dealId || ''),
+      String(title || ''),
+      String(action || ''),
+      String(atividadesCriadas || ''),
+      String(detalhes || '')
+    ]);
+    
+    const lastRow = sh.getLastRow();
+    
+    if (action === 'Processamento incremental') {
+      sh.getRange(lastRow, 1, 1, 6).setBackground('#d9ead3');
+    } else if (action === 'Requisitos não atendidos') {
+      sh.getRange(lastRow, 1, 1, 6).setBackground('#f4cccc');
+    }
+    
+    if (lastRow > 201) {
+      sh.deleteRows(2, lastRow - 201);
+    }
+  } catch (err) {
+    console.error('Erro ao adicionar log:', err);
+  }
+}
+
+function appendErrToSheet_(where, error, eventData) {
+  try {
+    const ss = getLogSpreadsheet_();
+    const sh = getOrCreateSheet_(ss, SHEET_ERR, [
+      'Timestamp', 
+      'DealID', 
+      'Erro', 
+      'Stack Trace', 
+      'Payload'
+    ]);
+    
+    const timestamp = Utilities.formatDate(new Date(), CFG.TZ, 'dd/MM/yyyy, HH:mm:ss');
+    const errorMessage = (error && error.message) ? String(error.message) : String(error);
+    const stackTrace = (error && error.stack) ? String(error.stack) : '';
+    
+    // ✅ Extrai DealID do payload
+    let dealId = '';
+    let payloadText = '';
+    
+    try {
+      if (eventData && eventData.postData && eventData.postData.contents) {
+        const payload = JSON.parse(eventData.postData.contents);
+        const current = payload.data || payload.current || {};
+        dealId = String(current.id || '');
+        
+        // ✅ Formata o payload completo de forma legível
+        payloadText = JSON.stringify(payload, null, 2);
+      } else if (eventData) {
+        payloadText = JSON.stringify(eventData, null, 2);
+      }
+    } catch (parseErr) {
+      payloadText = eventData ? String(eventData) : 'N/A';
+    }
+    
+    // ✅ Limita o tamanho do payload para evitar erros do Google Sheets (max 50.000 caracteres)
+    if (payloadText.length > 50000) {
+      payloadText = payloadText.substring(0, 50000) + '\n\n... (truncado)';
+    }
+    
+    sh.appendRow([
+      timestamp,
+      dealId,
+      errorMessage,
+      stackTrace,
+      payloadText
+    ]);
+    
+    const lastRow = sh.getLastRow();
+    sh.getRange(lastRow, 1, 1, 5).setBackground('#f4cccc');
+    
+    // ✅ Mantém apenas os últimos 500 erros
+    if (lastRow > 501) {
+      sh.deleteRows(2, lastRow - 501);
+    }
+    
+  } catch (err) {
+    console.error('Erro crítico ao registrar erro:', err);
+  }
+}
+
+function jsonOut_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj, null, 2))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/***********************
+ *  FUNÇÕES DE DIAGNÓSTICO
+ ***********************/
+function limparLocks() {
+  Logger.log('=== LIMPANDO TODOS OS LOCKS ===');
+  const props = PropertiesService.getScriptProperties();
+  const allProps = props.getProperties();
+  let count = 0;
+  
+  for (const key in allProps) {
+    if (key.startsWith('LOCK_') || key.startsWith('GLOBAL_PROCESSED_')) {
+      props.deleteProperty(key);
+      count++;
+    }
+  }
+  
+  Logger.log('✅ %s locks removidos', count);
+}
+
+function limparCacheAtividades() {
+  Logger.log('=== LIMPANDO CACHE DE ATIVIDADES ===');
+  for (const key in CREATED_ACTIVITIES_CACHE) {
+    delete CREATED_ACTIVITIES_CACHE[key];
+  }
+  Logger.log('✅ Cache limpo');
+}
