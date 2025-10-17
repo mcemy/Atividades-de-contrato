@@ -218,15 +218,6 @@ Este projeto está sob a licença MIT. Veja o arquivo `LICENSE` para mais detalh
 
 ---
 
-## 👨‍💻 **Autor**
-
-**Emerson Melo**  
-📧 Email: [seu-email@exemplo.com](mailto:seu-email@exemplo.com)  
-🔗 LinkedIn: [linkedin.com/in/seu-perfil](https://linkedin.com/in/seu-perfil)  
-🐙 GitHub: [@mcemy](https://github.com/mcemy)
-
----
-
 <div align="center">
 
 **⭐ Se este projeto foi útil, considere dar uma estrela!**
