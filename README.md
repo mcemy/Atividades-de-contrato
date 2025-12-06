@@ -203,6 +203,3 @@ tick();                  // Executa processamento completo
 
 ---
 
-[🔝 Voltar ao topo](#-atividades-de-contrato---automação-pipedrive)
-
-</div>
