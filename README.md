@@ -200,27 +200,8 @@ tick();                  // Executa processamento completo
 - 📊 **Precisão**: 99.9% de atividades criadas corretamente
 - 🔄 **Uptime**: 99.8% de disponibilidade
 
----
-
-## 🤝 **Contribuição**
-
-1. Fork o projeto
-2. Crie uma branch para sua feature (`git checkout -b feature/nova-funcionalidade`)
-3. Commit suas mudanças (`git commit -am 'Adiciona nova funcionalidade'`)
-4. Push para a branch (`git push origin feature/nova-funcionalidade`)
-5. Abra um Pull Request
 
 ---
-
-## 📄 **Licença**
-
-Este projeto está sob a licença MIT. Veja o arquivo `LICENSE` para mais detalhes.
-
----
-
-<div align="center">
-
-**⭐ Se este projeto foi útil, considere dar uma estrela!**
 
 [🔝 Voltar ao topo](#-atividades-de-contrato---automação-pipedrive)
 
